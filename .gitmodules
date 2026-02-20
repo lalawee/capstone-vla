@@ -7,3 +7,6 @@
 [submodule "third_party/diffusion_policy"]
 	path = third_party/diffusion_policy
 	url = https://github.com/lalawee/kuavo_data_challenge_diffusion_policy.git
+[submodule "lab/IsaacLab"]
+	path = lab/IsaacLab
+	url = https://github.com/lalawee/IsaacLab
