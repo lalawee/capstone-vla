@@ -1,0 +1,9 @@
+[submodule "third_party/gr00t"]
+	path = third_party/gr00t
+	url = https://github.com/lalawee/Isaac-GR00T.git
+[submodule "third_party/openpi"]
+	path = third_party/openpi
+	url = https://github.com/lalawee/openpi.git
+[submodule "third_party/diffusion_policy"]
+	path = third_party/diffusion_policy
+	url = https://github.com/lalawee/kuavo_data_challenge_diffusion_policy.git
