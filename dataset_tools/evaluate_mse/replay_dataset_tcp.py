@@ -4,7 +4,7 @@ Replay LeRobot-style dataset episodes (parquet + mp4s) through a Kuavo TCP polic
 print predicted actions, and compute MSE vs ground-truth actions.
 
 Expected dataset layout (as you described):
-  <root>/data/chunk-000000/episode_000123.parquet
+  <root>/data/chunk-000/episode_000123.parquet
   <root>/videos/chunk-000/observation.images.ego_view/episode_000123.mp4
   <root>/videos/chunk-000/observation.images.left_wrist_view/episode_000123.mp4
   <root>/videos/chunk-000/observation.images.right_wrist_view/episode_000123.mp4
@@ -16,7 +16,7 @@ Wire protocol: msgpack dict with 4-byte big-endian length prefix
 
 python replay_dataset_tcp.py \
   --root /path/to/lerobot_dataset \
-  --data-chunk chunk-000000 \
+  --data-chunk chunk-000 \
   --videos-chunk chunk-000 \
   --host 127.0.0.1 --port 5555 \
   --episodes 1 \
@@ -30,6 +30,16 @@ python replay_dataset_tcp.py \
   --host 127.0.0.1 --port 5555 \
   --episodes 10 \
   --print-every 20
+
+  PI0.5 with prompt:
+
+  python replay_dataset_tcp.py \
+  --root "/home/sensethreat/lab_mimic/VLA_IL/capstone-vla/dataset_tools/data/pourLeftCereal/Lusmse/pourLeftCereal" \
+  --host 127.0.0.1 --port 5555 \
+  --send-prompt \
+  --prompt-col task
+
+  Example
 
 """
 
@@ -199,12 +209,29 @@ def replay_episode(
     max_steps: Optional[int],
     print_every: int,
     jpeg_quality: int,
+    send_prompt: bool,
+    prompt_col: str,
+    prompt_default: Optional[str],
 ) -> Dict[str, float]:
     """
     Returns per-episode stats: mse, steps, etc.
     """
     episode_id = parse_episode_id(parquet_path)
     table = read_parquet_table(parquet_path)
+    episode_prompt = None
+
+
+    if send_prompt:
+        try:
+            prompt_arrow = get_column(table, prompt_col)
+            prompt_arr = prompt_arrow.to_numpy(zero_copy_only=False)
+
+            if len(prompt_arr) > 0:
+                episode_prompt = str(prompt_arr[0])
+            else:
+                episode_prompt = prompt_default
+        except Exception:
+            episode_prompt = prompt_default
 
     state = to_numpy_2d(get_column(table, state_col))    # [T, Ds]
     gt_action = to_numpy_2d(get_column(table, action_col))  # [T, Da]
@@ -255,6 +282,9 @@ def replay_episode(
             "meta": {"episode": int(episode_id), "t": int(t)},
         }
 
+        if send_prompt:
+            req["prompt"] = episode_prompt
+
         send_msg(conn, req)
         resp = recv_msg(conn)
 
@@ -287,8 +317,17 @@ def replay_episode(
 
 def main():
     ap = argparse.ArgumentParser()
+    # Optional prompt sending (for VLA models like pi0.5)
+    ap.add_argument("--send-prompt", action="store_true",
+                    help="Send prompt text from parquet to TCP server")
+    ap.add_argument("--prompt-col", default="task",
+                    help="Parquet column name containing prompt text")
+    ap.add_argument("--prompt-default", default=None,
+                    help="Fallback prompt if column missing")    
+    
+
     ap.add_argument("--root", required=True, help="Dataset root folder (contains data/ and videos/)")
-    ap.add_argument("--data-chunk", default="chunk-000000", help="data/<chunk-xxxxxx> folder name")
+    ap.add_argument("--data-chunk", default="chunk-000", help="data/<chunk-xxxxxx> folder name")
     ap.add_argument("--videos-chunk", default="chunk-000", help="videos/<chunk-xxx> folder name")
 
     # Parquet columns (you can override to match your schema)
@@ -363,6 +402,9 @@ def main():
                 max_steps=args.max_steps,
                 print_every=args.print_every,
                 jpeg_quality=args.jpeg_quality,
+                send_prompt=args.send_prompt,
+                prompt_col=args.prompt_col,
+                prompt_default=args.prompt_default,
             )
             if not np.isnan(stats["mse"]):
                 all_mse.append(stats["mse"])
