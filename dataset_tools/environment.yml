@@ -1,0 +1,11 @@
+name: lerobot_check
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pandas
+  - pyarrow
+  - numpy
+  - pip
+  - pip:
+      - decord
