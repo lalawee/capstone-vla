@@ -47,6 +47,21 @@ import pandas as pd
 # Utilities
 # -----------------------------
 
+def get_episode_last_timestamp_seconds(parquet_path: Path) -> Optional[float]:
+    """Read only timestamp column and return last non-null value as float."""
+    try:
+        # columns-only read (fast)
+        df = pd.read_parquet(parquet_path, columns=["timestamp"])
+        if df.empty:
+            return None
+        ts = pd.to_numeric(df["timestamp"], errors="coerce").dropna()
+        if ts.empty:
+            return None
+        return float(ts.iloc[-1])
+    except Exception:
+        return None
+
+
 def read_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -195,6 +210,78 @@ class Report:
 # Video helpers
 # -----------------------------
 
+def ffprobe_video_duration_seconds(video_path: Path) -> Optional[float]:
+    """Return container duration in seconds using ffprobe; otherwise None."""
+    ffprobe = which("ffprobe")
+    if not ffprobe:
+        return None
+    cmd = [
+        ffprobe, "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        str(video_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout)
+        fmt = data.get("format") or {}
+        dur = fmt.get("duration")
+        if dur is None:
+            return None
+        return float(dur)
+    except Exception:
+        return None
+
+
+def ffprobe_last_frame_time_seconds(video_path: Path, tail_seconds: float = 1.0) -> Optional[float]:
+    """
+    Return the timestamp_time (seconds) of the last decodable frame.
+    Uses -sseof to seek near the end and reads frames there, then takes max timestamp_time.
+    """
+    ffprobe = which("ffprobe")
+    if not ffprobe:
+        return None
+
+    # Seek from end by tail_seconds and list frames with timestamps
+    # We keep it small so it doesn't scan whole video.
+    cmd = [
+        ffprobe, "-v", "error",
+        "-select_streams", "v:0",
+        "-sseof", f"-{tail_seconds}",
+        "-show_frames",
+        "-show_entries", "frame=best_effort_timestamp_time,pkt_pts_time",
+        "-of", "json",
+        str(video_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout)
+        frames = data.get("frames") or []
+        if not frames:
+            return None
+
+        times: List[float] = []
+        for fr in frames:
+            # prefer best_effort_timestamp_time, fallback to pkt_pts_time
+            t = fr.get("best_effort_timestamp_time")
+            if t is None:
+                t = fr.get("pkt_pts_time")
+            if t is None:
+                continue
+            try:
+                times.append(float(t))
+            except Exception:
+                continue
+        if not times:
+            return None
+        return max(times)
+    except Exception:
+        return None
+
 def ffprobe_frame_count(video_path: Path) -> Optional[int]:
     """
     Return frame count using ffprobe if available; otherwise None.
@@ -321,8 +408,6 @@ def expected_video_path(root: Path, episode_index: int, chunks_size: int, video_
 
 def required_parquet_columns() -> List[str]:
     return [
-        "episode_chunk",
-        "episode_id",
         "episode_index",
         "index",
         "timestamp",
@@ -692,6 +777,7 @@ def check_videos(
     max_episodes: Optional[int],
     mode: str,
     tolerance_frames: int,
+    tolerance_seconds: float,
 ) -> Tuple[Optional[int], Dict[Tuple[int, str], Optional[int]]]:
     """
     Returns:
@@ -710,7 +796,13 @@ def check_videos(
     for i, ep in enumerate(eps_iter):
         ei = safe_int(ep.get("episode_index"), "episode_index", f"episodes.jsonl row {i}")
         expected_len = safe_int(ep.get("length"), "length", f"episodes.jsonl row {i}")
+        # We’ll collect per-key timing info for this episode
+        last_frame_sec_by_key: Dict[str, float] = {}
+        duration_sec_by_key: Dict[str, float] = {}
 
+        # parquet last timestamp (episode-level)
+        pq_path = expected_parquet_path(root, ei, chunks_size)
+        parquet_last_ts = get_episode_last_timestamp_seconds(pq_path)
         for k in video_keys:
             vp = expected_video_path(root, ei, chunks_size, k)
             if not vp.exists():
@@ -743,6 +835,62 @@ def check_videos(
                     report.add_warning("W_VIDEO_FRAMES_UNKNOWN",
                                        "Could not determine video frame count (no ffprobe and OpenCV failed)",
                                        episode_index=ei, video_key=k, path=str(vp))
+            # Timing checks require ffprobe
+            if which("ffprobe"):
+                dur = ffprobe_video_duration_seconds(vp)
+                last_t = ffprobe_last_frame_time_seconds(vp, tail_seconds=1.0)
+
+                if dur is not None:
+                    duration_sec_by_key[k] = dur
+                else:
+                    report.add_warning("W_VIDEO_DURATION_UNKNOWN",
+                                       "Could not read video duration via ffprobe",
+                                       episode_index=ei, video_key=k, path=str(vp))
+
+                if last_t is not None:
+                    last_frame_sec_by_key[k] = last_t
+                else:
+                    report.add_warning("W_VIDEO_LASTFRAME_TIME_UNKNOWN",
+                                       "Could not read last-frame timestamp via ffprobe",
+                                       episode_index=ei, video_key=k, path=str(vp))
+
+                # parquet timestamp <= video duration
+                if parquet_last_ts is not None and dur is not None:
+                    if parquet_last_ts > (dur + tolerance_seconds):
+                        report.add_warning(
+                            "W_PARQUET_TS_EXCEEDS_VIDEO_DURATION",
+                            "Last parquet timestamp is greater than video duration",
+                            episode_index=ei, video_key=k,
+                            parquet_last_ts=parquet_last_ts,
+                            video_duration_sec=dur,
+                            tolerance_seconds=tolerance_seconds,
+                            path=str(vp),
+                        )
+            else:
+                # If no ffprobe, we can’t reliably do timing checks
+                # (avoid spamming: warn once per episode)
+                pass
+        # Cross-camera last-frame seconds should match within tolerance
+        if mode in ("light", "heavy"):
+            if which("ffprobe"):
+                if len(last_frame_sec_by_key) >= 2:
+                    vals = list(last_frame_sec_by_key.values())
+                    spread = max(vals) - min(vals)
+                    if spread > tolerance_seconds:
+                        report.add_warning(
+                            "W_LAST_FRAME_SECONDS_MISMATCH",
+                            "Last-frame timestamps differ across video keys for the same episode",
+                            episode_index=ei,
+                            spread_seconds=spread,
+                            tolerance_seconds=tolerance_seconds,
+                            last_frame_sec_by_key=last_frame_sec_by_key,
+                        )
+            else:
+                # warn once per run would be nicer, but keep it simple:
+                report.add_warning(
+                    "W_NO_FFPROBE_TIMING_SKIPPED",
+                    "ffprobe not found; skipped last-frame seconds and duration/timestamp checks",
+                )
 
     return (total_frames_sum if counted_any else None), per_video_frames
 
@@ -750,6 +898,8 @@ def check_videos(
 def main() -> int:
     ap = argparse.ArgumentParser(description="LeRobot dataset health checker")
     ap.add_argument("--root", required=True, help="Dataset root directory")
+    ap.add_argument("--tolerance-seconds", type=float, default=0.05,
+                help="Allowed seconds difference for last-frame alignment and timestamp<=duration checks")
     ap.add_argument("--mode", choices=["meta", "light", "heavy"], default="light")
     ap.add_argument("--report", default=None, help="Write machine-readable JSON report to this path")
     ap.add_argument("--strict", action="store_true", help="Treat warnings as failures (exit code 2)")
@@ -812,6 +962,7 @@ def main() -> int:
             max_episodes=args.max_episodes,
             mode=args.mode,
             tolerance_frames=max(0, args.tolerance_frames),
+            tolerance_seconds=float(args.tolerance_seconds),
         )
 
         if args.mode == "heavy":
