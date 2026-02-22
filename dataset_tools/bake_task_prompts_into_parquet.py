@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+This is for Pi0!!!!!!!!!!!!!!!!!!!!!!!!
+
+
 Bake task prompts (string) into LeRobot-style parquet files by mapping task_index -> task text
 using a tasks.jsonl file.
 
