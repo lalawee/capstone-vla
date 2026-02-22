@@ -53,8 +53,55 @@ import pandas as pd
 # Constants
 # ─────────────────────────────────────────────
 
-# Indices into the 10D sim hand array to select the 6 real DOF
+# Indices into the 10D sim hand array to select the 6 real DOF (MCP joints only)
+# Extracts: [thumbCMC, thumbMCP, indexMCP, middleMCP, ringMCP, littleMCP]
+# = semantic order: [thumb_rot, thumb_bend, index, middle, ring, little]
 HAND_SIM_TO_REAL_IDX = [0, 1, 2, 4, 6, 8]
+
+# Sim hand joint URDF limits (from URDF, lower=0 for all joints)
+# Order: [thumbCMC, thumbMCP, indexMCP, middleMCP, ringMCP, littleMCP]
+HAND_SIM_LOWER = np.array([0.0,    0.0,    0.0,   0.0,   0.0,   0.0  ], dtype=np.float32)
+HAND_SIM_UPPER = np.array([1.5708, 0.8727, 1.309, 1.309, 1.309, 1.309], dtype=np.float32)
+
+# Real robot joint limits from _normalize_hand_joints()
+# Order: [thumb1, thumb2, index, middle, ring, pinky] = same semantic order
+# sim=0 (LOWER) -> open hand -> REAL_LOWER (negative)
+# sim=upper     -> closed    -> REAL_UPPER (positive)
+HAND_REAL_LOWER = np.array([-1.5, -1.5, -1.5, -1.5, -3.0, -3.0], dtype=np.float32)
+HAND_REAL_UPPER = np.array([ 1.5,  1.5,  1.5,  1.5,  3.0,  3.0], dtype=np.float32)
+
+
+def sim_hand_to_real_radians(hand_6d: np.ndarray) -> np.ndarray:
+    """
+    Convert 6D sim hand (radians) to real robot radians via linear rescale.
+
+    URDF limits: lower=0, upper varies per joint (all joints start at 0=open).
+    Real robot:  LOWER=negative (open), UPPER=positive (closed/gripping).
+
+    Linear rescale:
+        t        = (sim_rad - SIM_LOWER) / (SIM_UPPER - SIM_LOWER)  in [0, 1]
+        real_rad = REAL_LOWER + (REAL_UPPER - REAL_LOWER) * t
+
+    Boundary behaviour:
+        sim=0          -> t=0 -> REAL_LOWER (fully open)
+        sim=SIM_UPPER  -> t=1 -> REAL_UPPER (fully closed)
+
+    Args:
+        hand_6d: (T, 6) sim radians, order:
+                 [thumbCMC, thumbMCP, indexMCP, middleMCP, ringMCP, littleMCP]
+    Returns:
+        (T, 6) real robot radians within [REAL_LOWER, REAL_UPPER]
+    """
+    sim_range  = HAND_SIM_UPPER - HAND_SIM_LOWER   # [1.5708, 0.8727, 1.309, 1.309, 1.309, 1.309]
+    real_range = HAND_REAL_UPPER - HAND_REAL_LOWER  # [3.0, 3.0, 3.0, 3.0, 6.0, 6.0]
+
+    # Normalise to [0, 1], clip for safety against numerical overshoot
+    t = np.clip((hand_6d - HAND_SIM_LOWER) / sim_range, 0.0, 1.0)
+
+    # Rescale to real range
+    real_rad = HAND_REAL_LOWER + real_range * t
+
+    return real_rad.astype(np.float32)
 
 # 44D LeRobot state/action vector layout
 STATE_DIM = 44
@@ -108,12 +155,17 @@ def sim_34d_to_lerobot_44d(sim_actions: np.ndarray) -> np.ndarray:
     out[:, SEG_LEFT_ARM]  = sim_actions[:, 0:7]
     out[:, SEG_RIGHT_ARM] = sim_actions[:, 7:14]
 
-    # Hands - 10D sim -> 6D real via MCP index selection
+    # Hands: 10D sim -> 6D (MCP extraction) -> percent inverse -> real radians
     left_hand_sim  = sim_actions[:, 14:24]   # (T, 10)
     right_hand_sim = sim_actions[:, 24:34]   # (T, 10)
 
-    out[:, SEG_LEFT_HAND]  = left_hand_sim[:, HAND_SIM_TO_REAL_IDX]   # (T, 6)
-    out[:, SEG_RIGHT_HAND] = right_hand_sim[:, HAND_SIM_TO_REAL_IDX]  # (T, 6)
+    # Extract the 6 MCP joints (drops PIP duplicates)
+    left_hand_6d  = left_hand_sim[:, HAND_SIM_TO_REAL_IDX]    # (T, 6) sim radians
+    right_hand_6d = right_hand_sim[:, HAND_SIM_TO_REAL_IDX]   # (T, 6) sim radians
+
+    # Convert sim radians -> real robot radians via 0-100 percent intermediate
+    out[:, SEG_LEFT_HAND]  = sim_hand_to_real_radians(left_hand_6d)
+    out[:, SEG_RIGHT_HAND] = sim_hand_to_real_radians(right_hand_6d)
 
     # Leg, neck, waist remain zero (already initialised to 0)
     return out
