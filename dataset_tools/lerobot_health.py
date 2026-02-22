@@ -420,7 +420,15 @@ def expected_parquet_path(root: Path, episode_index: int, chunks_size: int) -> P
 
 def expected_video_path(root: Path, episode_index: int, chunks_size: int, video_key: str) -> Path:
     ch = compute_episode_chunk(episode_index, chunks_size)
-    return root / "videos" / fmt_chunk(ch) / modality_video_folder_name(video_key) / f"{fmt_episode(episode_index)}.mp4"
+
+    # Option 1: folder is "observation.images.<key>"
+    p1 = root / "videos" / fmt_chunk(ch) / modality_video_folder_name(video_key) / f"{fmt_episode(episode_index)}.mp4"
+    if p1.exists():
+        return p1
+
+    # Option 2: folder is just "<key>" (some exporters use this)
+    p2 = root / "videos" / fmt_chunk(ch) / video_key / f"{fmt_episode(episode_index)}.mp4"
+    return p2
 
 def required_parquet_columns() -> List[str]:
     return [
