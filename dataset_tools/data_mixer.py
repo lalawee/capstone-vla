@@ -133,6 +133,64 @@ def ds_paths(root: Path) -> DatasetPaths:
         videos=root / "videos",
     )
 
+def resolve_video_dirnames(ds: DatasetPaths, camera_keys: List[str]) -> Dict[str, str]:
+    """
+    Map logical camera keys (e.g. 'ego_view') to actual directory names on disk.
+
+    Preference order (important to avoid double-prefix bugs):
+    1) exact: 'observation.images.{key}'
+    2) exact: '{key}'
+    3) single suffix match: endswith('.{key}')
+    4) single contains match
+    """
+    chunks = list_chunk_dirs(ds.videos)
+    if not chunks:
+        raise FileNotFoundError(f"No chunk-* directories found under {ds.videos}")
+
+    # use first chunk that exists (usually chunk-000)
+    chunk0 = chunks[0]
+    subdirs = [p.name for p in chunk0.iterdir() if p.is_dir()]
+
+    mapping: Dict[str, str] = {}
+    for key in camera_keys:
+        preferred = f"observation.images.{key}"
+        if preferred in subdirs:
+            mapping[key] = preferred
+            continue
+        if key in subdirs:
+            mapping[key] = key
+            continue
+
+        suffix_matches = [d for d in subdirs if d.endswith(f".{key}")]
+        if len(suffix_matches) == 1:
+            mapping[key] = suffix_matches[0]
+            continue
+        if len(suffix_matches) > 1:
+            # still ambiguous — show user candidates
+            raise SystemExit(
+                f"Ambiguous video dirs for camera key '{key}': {suffix_matches}. "
+                f"Preferred '{preferred}'. Please delete/rename the extra folder(s)."
+            )
+
+        contains_matches = [d for d in subdirs if key in d]
+        if len(contains_matches) == 1:
+            mapping[key] = contains_matches[0]
+            continue
+        if len(contains_matches) > 1:
+            raise SystemExit(
+                f"Ambiguous video dirs for camera key '{key}': {contains_matches}. "
+                f"Preferred '{preferred}'. Please delete/rename the extra folder(s)."
+            )
+
+        raise FileNotFoundError(
+            f"Could not resolve a video directory for camera key '{key}'. "
+            f"Found subdirs in {chunk0}: {subdirs}"
+        )
+
+    return mapping
+
+
+
 def list_chunk_dirs(parent: Path) -> List[Path]:
     if not parent.exists():
         return []
@@ -159,9 +217,14 @@ def episode_to_chunk(ep_index: int, episodes_per_chunk: int) -> int:
     return ep_index // episodes_per_chunk
 
 def ensure_chunk_dirs(dst: DatasetPaths, chunk_idx: int, camera_keys: List[str]) -> None:
+    """Create chunk directories for data and videos.
+    Accepts either raw keys ('ego_view') or pre-prefixed ('observation.images.ego_view').
+    Always strips any existing prefix before re-applying it to avoid double-prefix dirs.
+    """
     (dst.data / chunk_name(chunk_idx)).mkdir(parents=True, exist_ok=True)
     for cam in camera_keys:
-        (dst.videos / chunk_name(chunk_idx) / cam).mkdir(parents=True, exist_ok=True)
+        raw_cam = cam[len("observation.images."):] if cam.startswith("observation.images.") else cam
+        (dst.videos / chunk_name(chunk_idx) / f"observation.images.{raw_cam}").mkdir(parents=True, exist_ok=True)
 
 def find_episode_parquet(ds: DatasetPaths, episode_index: int) -> Path:
     name = f"episode_{episode_index:06d}.parquet"
@@ -173,11 +236,16 @@ def find_episode_parquet(ds: DatasetPaths, episode_index: int) -> Path:
 
 def find_episode_video(ds: DatasetPaths, camera_key: str, episode_index: int) -> Path:
     name = f"episode_{episode_index:06d}.mp4"
+    raw_key = camera_key[len("observation.images."):] if camera_key.startswith("observation.images.") else camera_key
+    cam_dir = f"observation.images.{raw_key}"
     for chunk in list_chunk_dirs(ds.videos):
-        cand = chunk / camera_key / name
+        cand = chunk / cam_dir / name
         if cand.exists():
             return cand
-    raise FileNotFoundError(f"Could not find video for episode {episode_index}, camera {camera_key} under {ds.videos}")
+    raise FileNotFoundError(
+        f"Could not find video for episode {episode_index}, camera {camera_key} under {ds.videos} "
+        f"(expected folder '{cam_dir}')"
+    )
 
 def extract_camera_keys_from_modality(modality: Dict[str, Any]) -> List[str]:
     """
@@ -260,16 +328,27 @@ def copy_episode_assets(
     src_episode: int,
     dst_episode: int,
     camera_keys: List[str],
+    video_dir_map: Dict[str, str],
     dst_chunk_idx: int,
 ) -> Path:
     """Copies parquet + all camera videos. Returns dst parquet path."""
+
+    # Copy parquet
     src_parquet = find_episode_parquet(src_ds, src_episode)
     dst_parquet = dst_ds.data / chunk_name(dst_chunk_idx) / f"episode_{dst_episode:06d}.parquet"
     copy_file(src_parquet, dst_parquet)
 
+    # Copy videos (ALL cameras)
     for cam in camera_keys:
+        src_dir = video_dir_map[cam]  # e.g. "observation.images.ego_view"
         src_vid = find_episode_video(src_ds, cam, src_episode)
-        dst_vid = dst_ds.videos / chunk_name(dst_chunk_idx) / cam / f"episode_{dst_episode:06d}.mp4"
+
+        dst_vid = (
+            dst_ds.videos
+            / chunk_name(dst_chunk_idx)
+            / src_dir
+            / f"episode_{dst_episode:06d}.mp4"
+        )
         copy_file(src_vid, dst_vid)
 
     return dst_parquet
@@ -315,8 +394,13 @@ def mix_datasets(dataset_a: Path, dataset_b: Path, out: Path, percent_b: float, 
         raise SystemExit("Refusing to mix: modality.json differs between A and B.")
 
     camera_keys = extract_camera_keys_from_modality(a_mod)
+
     if not camera_keys:
         raise SystemExit("Could not extract camera keys from modality.json (expected modality['video']).")
+    video_dir_map = resolve_video_dirnames(A, camera_keys)
+    print("[INFO] Video directory mapping:")
+    for k in camera_keys:
+        print(f"       {k} -> {video_dir_map[k]}")
     num_cams = len(camera_keys)
 
     a_info = read_json(A.meta / "info.json")
@@ -359,9 +443,16 @@ def mix_datasets(dataset_a: Path, dataset_b: Path, out: Path, percent_b: float, 
     # Copy + rewrite A (rewrite global index too, to guarantee clean 0..N-1)
     for ep in range(total_a):
         ch = episode_to_chunk(ep, episodes_per_chunk)
-        ensure_chunk_dirs(C, ch, camera_keys)
-        dst_parquet = copy_episode_assets(A, C, src_episode=ep, dst_episode=ep, camera_keys=camera_keys, dst_chunk_idx=ch)
+        video_dirnames = [video_dir_map[k] for k in camera_keys]
+        ensure_chunk_dirs(C, ch, video_dirnames)
 
+        dst_parquet = copy_episode_assets(
+            A, C,
+            src_episode=ep, dst_episode=ep,
+            camera_keys=camera_keys,
+            video_dir_map=video_dir_map,
+            dst_chunk_idx=ch
+        )
         n = rewrite_parquet_indices(dst_parquet, new_episode_index=ep, start_global_index=global_cursor, b_task_old2new=None)
         global_cursor += n
 
@@ -371,15 +462,27 @@ def mix_datasets(dataset_a: Path, dataset_b: Path, out: Path, percent_b: float, 
         row["length"] = int(row.get("length", n))
         out_episodes.append(row)
 
+    # Resolve B's video directory mapping (may differ from A's if B has different naming)
+    video_dir_map_b = resolve_video_dirnames(B, camera_keys)
+
     # Append selected B episodes
     appended_b = 0
     appended_b_frames = 0
     for src_ep in chosen_b:
         dst_ep = total_a + appended_b
         ch = episode_to_chunk(dst_ep, episodes_per_chunk)
-        ensure_chunk_dirs(C, ch, camera_keys)
-        dst_parquet = copy_episode_assets(B, C, src_episode=src_ep, dst_episode=dst_ep, camera_keys=camera_keys, dst_chunk_idx=ch)
+        # Only call ensure_chunk_dirs ONCE with the already-prefixed dirnames
+        video_dirnames = [video_dir_map[k] for k in camera_keys]
+        ensure_chunk_dirs(C, ch, video_dirnames)
 
+        dst_parquet = copy_episode_assets(
+            B, C,                          # FIX: copy FROM B, not A
+            src_episode=src_ep,            # FIX: use src_ep (B episode index), not stale ep
+            dst_episode=dst_ep,
+            camera_keys=camera_keys,
+            video_dir_map=video_dir_map_b, # FIX: use B's video dir mapping
+            dst_chunk_idx=ch
+        )
         n = rewrite_parquet_indices(dst_parquet, new_episode_index=dst_ep, start_global_index=global_cursor, b_task_old2new=b_task_old2new)
         global_cursor += n
         appended_b_frames += n
@@ -449,18 +552,19 @@ def parse_episode_idx_from_name(p: Path) -> int:
 
 def check_dataset(dataset: Path) -> None:
     D = ds_paths(dataset)
+
     info = read_json(D.meta / "info.json")
     modality = read_json(D.meta / "modality.json")
     camera_keys = extract_camera_keys_from_modality(modality)
     num_cams = len(camera_keys)
-
+    video_dir_map = resolve_video_dirnames(D, camera_keys)
     eps_rows = read_jsonl(D.meta / "episodes.jsonl")
     total_episodes = int(info.get("total_episodes", len(eps_rows)))
     total_frames = int(info.get("total_frames", -1))
 
     if total_episodes <= 0:
         raise SystemExit("[FAIL] total_episodes <= 0")
-
+    
     # chunks_size semantics: episodes per chunk
     chunks_size = episodes_per_chunk_from_info(info, default_chunks_size=900)
     expected_total_chunks = compute_total_chunks(total_episodes, chunks_size)
@@ -578,7 +682,7 @@ def check_dataset(dataset: Path) -> None:
 
         for cam in camera_keys:
             expected_mp4 = f"episode_{ep:06d}.mp4"
-            mp4 = find_episode_video(D, cam, ep)
+            mp4 = find_episode_video(D, video_dir_map[cam], ep)
             if mp4.name != expected_mp4:
                 raise SystemExit(f"[FAIL] Video filename mismatch ep={ep}, cam={cam}: found {mp4.name}, expected {expected_mp4}")
 
