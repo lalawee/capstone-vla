@@ -381,13 +381,29 @@ REQUIRED_META = ["info.json", "episodes.jsonl", "tasks.jsonl"]
 
 def discover_video_keys_from_info(info: Dict[str, Any]) -> List[str]:
     feats = info.get("features") or {}
-    vids = feats.get("observation") or {}
-    imgs = vids.get("images") or {}
-    # keys under observation.images.* should be video keys
-    keys = list(imgs.keys())
-    # stable order
-    keys.sort()
-    return keys
+
+    keys = set()
+
+    # Case A: nested schema (older / some exporters)
+    obs = feats.get("observation")
+    if isinstance(obs, dict):
+        imgs = obs.get("images")
+        if isinstance(imgs, dict):
+            for k in imgs.keys():
+                if isinstance(k, str):
+                    keys.add(k)
+
+    # Case B: flat schema (your dataset): "observation.images.<key>"
+    if isinstance(feats, dict):
+        for feat_name, spec in feats.items():
+            if not isinstance(feat_name, str):
+                continue
+            m = re.match(r"^observation\.images\.(.+)$", feat_name)
+            if m:
+                keys.add(m.group(1))
+
+    out = sorted(keys)
+    return out
 
 def modality_video_folder_name(video_key: str) -> str:
     # your structure: videos/chunk-000/observation.images.ego_view/episode_000000.mp4
