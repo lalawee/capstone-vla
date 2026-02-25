@@ -202,6 +202,69 @@ def extract_frames_to_mp4(
 
 
 # ─────────────────────────────────────────────
+# Trimming logic
+# ─────────────────────────────────────────────
+
+def compute_trim_steps(trim_seconds: float) -> int:
+    """Convert trim duration in seconds to number of steps to remove.
+    
+    Each recorded step = STEP_DT seconds (default 0.05s).
+    So 1.0 second = 20 steps, 2.0 seconds = 40 steps.
+    """
+    if trim_seconds <= 0:
+        return 0
+    steps = int(round(trim_seconds / STEP_DT))
+    return steps
+
+
+def compute_jerk_trim_steps(
+    actions: np.ndarray,
+    jerk_threshold: float = 0.5,
+    window: int = 3,
+    max_trim_steps: int = 60,
+) -> int:
+    """Auto-detect how many initial steps to trim based on joint velocity jerk.
+    
+    Computes frame-to-frame joint velocity magnitude. The "jerky snap to ready"
+    shows up as large velocity spikes at the start. We find the last step within
+    [0, max_trim_steps] where the max joint velocity exceeds jerk_threshold,
+    then trim up to that point + a small buffer.
+    
+    Args:
+        actions: (T, D) array of joint positions
+        jerk_threshold: rad/step velocity above which we consider "jerky"
+        window: extra steps to trim after the last detected jerk
+        max_trim_steps: don't look beyond this many steps from the start
+    
+    Returns:
+        Number of steps to trim from the start.
+    """
+    if actions.shape[0] < 3:
+        return 0
+    
+    # Compute per-step velocity (first difference)
+    vel = np.diff(actions, axis=0)  # (T-1, D)
+    # Max absolute velocity across all joints per step
+    max_vel = np.max(np.abs(vel), axis=1)  # (T-1,)
+    
+    # Only look at the first max_trim_steps
+    search_range = min(max_trim_steps, len(max_vel))
+    
+    # Find the last step in the search range that exceeds the threshold
+    last_jerk_idx = -1
+    for i in range(search_range):
+        if max_vel[i] > jerk_threshold:
+            last_jerk_idx = i
+    
+    if last_jerk_idx < 0:
+        return 0  # No jerk detected
+    
+    # Trim up to last_jerk_idx + window (the +1 accounts for diff offset)
+    trim = min(last_jerk_idx + 1 + window, actions.shape[0] - 1)
+    return trim
+
+
+# ─────────────────────────────────────────────
 # Per-episode processing
 # ─────────────────────────────────────────────
 
@@ -214,31 +277,72 @@ def process_episode(
     task_description: str,
     fps: float,
     export_video: bool,
+    trim_start_steps: int = 0,
+    trim_end_steps: int = 0,
+    auto_trim: bool = False,
+    jerk_threshold: float = 0.5,
 ) -> dict:
     """
     Process a single demo from the HDF5 file.
 
     Returns episode metadata dict:
-        {episode_index, length, tasks}
+        {episode_index, length, tasks, trimmed_start, trimmed_end}
     """
     demo = hdf5_file[f"data/{demo_key}"]
 
     # ── Load raw arrays ──────────────────────────────────────────────
-    # Commanded actions (T, 34) — this is "action" in LeRobot
-    actions_34d = np.array(demo["actions"], dtype=np.float32)           # (T, 34)
-
-    # State proxy: obs/actions = last_action = what was commanded at t
-    # This is our best approximation of observed state in 34D space
+    actions_34d = np.array(demo["actions"], dtype=np.float32)             # (T, 34)
     obs_actions_34d = np.array(demo["obs"]["actions"], dtype=np.float32)  # (T, 34)
 
+    T_original = actions_34d.shape[0]
+
+    # ── Compute trim amounts ─────────────────────────────────────────
+    actual_trim_start = trim_start_steps
+    
+    if auto_trim:
+        # Use jerk detection to find optimal trim point
+        auto_steps = compute_jerk_trim_steps(
+            actions_34d, 
+            jerk_threshold=jerk_threshold,
+        )
+        # Take the larger of manual and auto-detected trim
+        actual_trim_start = max(trim_start_steps, auto_steps)
+        if auto_steps > 0:
+            print(f"    Auto-trim detected {auto_steps} jerky steps (threshold={jerk_threshold:.2f} rad/step)")
+    
+    actual_trim_end = trim_end_steps
+    
+    # Validate: ensure we don't trim more than the episode length (keep at least 2 steps)
+    total_trim = actual_trim_start + actual_trim_end
+    if total_trim >= T_original - 1:
+        print(f"    [WARN] Trim ({actual_trim_start}+{actual_trim_end}={total_trim}) >= episode length ({T_original}). Reducing trim.")
+        # Scale back proportionally, keep at least 2 steps
+        max_trim = T_original - 2
+        if actual_trim_start + actual_trim_end > max_trim:
+            # Prioritize start trim (that's where the jerk is)
+            actual_trim_start = min(actual_trim_start, max_trim)
+            actual_trim_end = min(actual_trim_end, max_trim - actual_trim_start)
+    
+    # ── Apply trimming ───────────────────────────────────────────────
+    end_idx = T_original - actual_trim_end if actual_trim_end > 0 else T_original
+    
+    actions_34d     = actions_34d[actual_trim_start:end_idx]
+    obs_actions_34d = obs_actions_34d[actual_trim_start:end_idx]
+    
     T = actions_34d.shape[0]
+    
+    if actual_trim_start > 0 or actual_trim_end > 0:
+        trim_start_sec = actual_trim_start * STEP_DT
+        trim_end_sec = actual_trim_end * STEP_DT
+        print(f"    Trimmed: {T_original} → {T} steps "
+              f"(removed {actual_trim_start} from start [{trim_start_sec:.2f}s], "
+              f"{actual_trim_end} from end [{trim_end_sec:.2f}s])")
 
     # ── Convert to 44D ───────────────────────────────────────────────
     state_44d  = sim_34d_to_lerobot_44d(obs_actions_34d)   # (T, 44) - state at t
     action_44d = sim_34d_to_lerobot_44d(actions_34d)       # (T, 44) - command at t
 
-    # ── Build timestamps ─────────────────────────────────────────────
-    # t=0 corresponds to the first recorded step
+    # ── Build timestamps (re-baselined to 0 after trim) ──────────────
     timestamps = np.arange(T, dtype=np.float32) * STEP_DT  # seconds
 
     # ── Determine chunk ──────────────────────────────────────────────
@@ -251,10 +355,14 @@ def process_episode(
             if hdf5_key not in demo["obs"]:
                 print(f"  [WARN] {hdf5_key} not found in {demo_key}, skipping")
                 continue
-            rgb_data = np.array(demo["obs"][hdf5_key], dtype=np.uint8)  # (T, H, W, C)
+            rgb_data = np.array(demo["obs"][hdf5_key], dtype=np.uint8)  # (T_orig, H, W, C)
+            
+            # Apply same trimming to video frames
+            rgb_data = rgb_data[actual_trim_start:end_idx]
+            
             video_path = output_root / "videos" / chunk_name / lerobot_key / f"episode_{episode_index:06d}.mp4"
             extract_frames_to_mp4(rgb_data, video_path, fps=fps)
-            print(f"  Written: {video_path.relative_to(output_root)}")
+            print(f"    Written: {video_path.relative_to(output_root)}")
 
     # ── Build parquet rows ───────────────────────────────────────────
     rows = []
@@ -270,9 +378,9 @@ def process_episode(
             "action":            action_44d[t].tolist(),
             "timestamp":         float(timestamps[t]),
             "annotation.human.action.task_description": task_description,
-            "task_index":   0,   # task 0 = main task (see tasks.jsonl)
+            "task_index":   0,
             "annotation.human.validity": "valid",
-            "next.reward":  float(is_last),  # 1.0 on last step, 0 otherwise
+            "next.reward":  float(is_last),
             "next.done":    bool(is_last),
             "is_last_row":  bool(is_last),
         }
@@ -285,12 +393,15 @@ def process_episode(
 
     df = pd.DataFrame(rows)
     df.to_parquet(parquet_path, index=False)
-    print(f"  Written: {parquet_path.relative_to(output_root)}  ({T} rows)")
+    print(f"    Written: {parquet_path.relative_to(output_root)}  ({T} rows)")
 
     return {
         "episode_index": episode_index,
         "tasks": [task_description, "valid"],
         "length": T,
+        "original_length": T_original,
+        "trimmed_start": actual_trim_start,
+        "trimmed_end": actual_trim_end,
     }
 
 
@@ -302,7 +413,6 @@ def write_tasks_jsonl(output_root: Path, task_description: str) -> None:
     meta_dir = output_root / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
     with open(meta_dir / "tasks.jsonl", "w") as f:
-        # Index 0 = main task, index 1 = "valid" (reserved per your convention)
         f.write(json.dumps({"task_index": 0, "task": task_description}) + "\n")
         f.write(json.dumps({"task_index": 1, "task": "valid"}) + "\n")
 
@@ -312,15 +422,19 @@ def write_episodes_jsonl(output_root: Path, episode_metas: list) -> None:
     meta_dir.mkdir(parents=True, exist_ok=True)
     with open(meta_dir / "episodes.jsonl", "w") as f:
         for ep in episode_metas:
-            f.write(json.dumps(ep) + "\n")
+            # Write only the standard fields (don't leak internal trim metadata)
+            out = {
+                "episode_index": ep["episode_index"],
+                "tasks": ep["tasks"],
+                "length": ep["length"],
+            }
+            f.write(json.dumps(out) + "\n")
 
 
 def write_info_json(output_root: Path, episode_metas: list, fps: float) -> None:
     total_rows = sum(ep["length"] for ep in episode_metas)
     total_episodes = len(episode_metas)
     num_video_keys = len(CAMERA_MAP)
-    # LeRobot total_frames = sum of frames across ALL video streams
-    # i.e. total_rows * num_cameras (each timestep has one frame per camera)
     total_frames = total_rows * num_video_keys
 
     info = {
@@ -369,7 +483,6 @@ def write_info_json(output_root: Path, episode_metas: list, fps: float) -> None:
 
 
 def write_modality_json(output_root: Path) -> None:
-    """Copy the modality.json structure matching your real dataset."""
     modality = {
         "state": {
             "left_arm":   {"start": 0,  "end": 7},
@@ -414,23 +527,14 @@ def write_modality_json(output_root: Path) -> None:
 
 
 def _build_state_names() -> list:
-    """Human-readable names for each of the 44 state/action dimensions."""
     names = []
-    # left arm
     names += [f"left_arm_joint_{i+1}" for i in range(7)]
-    # left hand (6 real DOF: thumbCMC, thumbMCP, indexMCP, middleMCP, ringMCP, littleMCP)
     names += ["left_thumbCMC", "left_thumbMCP", "left_indexMCP", "left_middleMCP", "left_ringMCP", "left_littleMCP"]
-    # left leg (zeros)
     names += [f"left_leg_{i}" for i in range(6)]
-    # neck (zeros)
     names += [f"neck_{i}" for i in range(3)]
-    # right arm
     names += [f"right_arm_joint_{i+1}" for i in range(7)]
-    # right hand
-    names += ["right_thumbCMC", "right_thumbMCP", "right_indexMCP", "right_middleMCP", "right_ringMCP", "right_littleMCP"]
-    # right leg (zeros)
+    names += ["right_thumbCMC", "right_thumbMCP", "right_indexMCP", "right_middleMCP", "right_rightMCP", "right_littleMCP"]
     names += [f"right_leg_{i}" for i in range(6)]
-    # waist (zeros)
     names += [f"waist_{i}" for i in range(3)]
     return names
 
@@ -464,7 +568,7 @@ def validate_dataset(output_root: Path, episode_metas: list) -> None:
     else:
         print(f"  ✓ Global index: 0 → {max(all_indices)} (no gaps, no duplicates)")
 
-    # 3. Episode length consistency (meta vs parquet row count)
+    # 3. Episode length consistency
     for ep in episode_metas:
         ep_idx = ep["episode_index"]
         chunk = ep_idx // CHUNK_SIZE
@@ -479,7 +583,7 @@ def validate_dataset(output_root: Path, episode_metas: list) -> None:
     if not errors:
         print(f"  ✓ All episode lengths match meta")
 
-    # 4. is_last_row check (exactly one per episode)
+    # 4. is_last_row check
     for ep in episode_metas:
         ep_idx = ep["episode_index"]
         chunk = ep_idx // CHUNK_SIZE
@@ -514,6 +618,28 @@ def validate_dataset(output_root: Path, episode_metas: list) -> None:
     else:
         print(f"\n  ✓ All checks passed!")
     print("──────────────────────────────────────────────────────────\n")
+
+
+def print_trim_summary(episode_metas: list) -> None:
+    """Print a summary of trimming applied across all episodes."""
+    trimmed_episodes = [ep for ep in episode_metas if ep["trimmed_start"] > 0 or ep["trimmed_end"] > 0]
+    if not trimmed_episodes:
+        return
+    
+    print(f"\n── Trimming Summary ──────────────────────────────────────")
+    total_original = sum(ep["original_length"] for ep in episode_metas)
+    total_after = sum(ep["length"] for ep in episode_metas)
+    total_removed = total_original - total_after
+    
+    start_trims = [ep["trimmed_start"] for ep in episode_metas]
+    end_trims = [ep["trimmed_end"] for ep in episode_metas]
+    
+    print(f"  Episodes trimmed: {len(trimmed_episodes)}/{len(episode_metas)}")
+    print(f"  Total steps: {total_original} → {total_after} (removed {total_removed}, {100*total_removed/total_original:.1f}%)")
+    print(f"  Start trim range: {min(start_trims)}–{max(start_trims)} steps ({min(start_trims)*STEP_DT:.2f}–{max(start_trims)*STEP_DT:.2f}s)")
+    if any(t > 0 for t in end_trims):
+        print(f"  End trim range: {min(end_trims)}–{max(end_trims)} steps")
+    print(f"──────────────────────────────────────────────────────────\n")
 
 
 # ─────────────────────────────────────────────
@@ -558,11 +684,50 @@ def main():
         default=None,
         help="Limit number of episodes to convert (for testing)",
     )
+    
+    # ── Trimming arguments ───────────────────────────────────────────
+    trim_group = parser.add_argument_group("Trimming", "Remove jerky start/end frames from episodes")
+    trim_group.add_argument(
+        "--trim-start",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Trim this many seconds from the START of each episode. "
+             "Removes the jerky snap-to-ready frames. (default: 0, typical: 0.5–2.0)",
+    )
+    trim_group.add_argument(
+        "--trim-end",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Trim this many seconds from the END of each episode. (default: 0)",
+    )
+    trim_group.add_argument(
+        "--auto-trim",
+        action="store_true",
+        default=False,
+        help="Automatically detect and trim jerky start frames using joint velocity analysis. "
+             "Takes the max of --trim-start and auto-detected trim. "
+             "Useful when jerk duration varies per episode.",
+    )
+    trim_group.add_argument(
+        "--jerk-threshold",
+        type=float,
+        default=0.5,
+        metavar="RAD_PER_STEP",
+        help="Joint velocity threshold (rad/step) for auto-trim jerk detection. "
+             "Lower = more aggressive trimming. (default: 0.5)",
+    )
+    
     args = parser.parse_args()
 
     input_path  = Path(args.input)
     output_root = Path(args.output)
     export_video = not args.no_video
+    
+    # Convert trim seconds to steps
+    trim_start_steps = compute_trim_steps(args.trim_start)
+    trim_end_steps = compute_trim_steps(args.trim_end)
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input HDF5 not found: {input_path}")
@@ -573,6 +738,12 @@ def main():
     print(f"  Output: {output_root}")
     print(f"  FPS:    {args.fps}")
     print(f"  Video:  {'yes' if export_video else 'no (--no-video)'}")
+    if args.trim_start > 0 or args.trim_end > 0 or args.auto_trim:
+        print(f"  Trim:   start={args.trim_start:.2f}s ({trim_start_steps} steps)"
+              f", end={args.trim_end:.2f}s ({trim_end_steps} steps)"
+              f"{', auto-trim ON' if args.auto_trim else ''}")
+        if args.auto_trim:
+            print(f"          jerk threshold={args.jerk_threshold:.2f} rad/step")
     print(f"{'='*60}\n")
 
     # Write static meta files first
@@ -583,7 +754,6 @@ def main():
     global_index = 0
 
     with h5py.File(input_path, "r") as f:
-        # Collect demo keys in sorted order (demo_0, demo_1, ...)
         all_demo_keys = sorted(
             [k for k in f["data"].keys() if k.startswith("demo_")],
             key=lambda x: int(x.split("_")[1]),
@@ -606,6 +776,10 @@ def main():
                 task_description=args.task,
                 fps=args.fps,
                 export_video=export_video,
+                trim_start_steps=trim_start_steps,
+                trim_end_steps=trim_end_steps,
+                auto_trim=args.auto_trim,
+                jerk_threshold=args.jerk_threshold,
             )
             episode_metas.append(meta)
             global_index += meta["length"]
@@ -617,6 +791,9 @@ def main():
     print(f"\nConversion complete!")
     print(f"  Total episodes: {len(episode_metas)}")
     print(f"  Total frames:   {global_index}")
+
+    # Print trim summary
+    print_trim_summary(episode_metas)
 
     # Run integrity validation
     validate_dataset(output_root, episode_metas)
