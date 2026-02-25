@@ -2,6 +2,8 @@
 This script will help you convert any LeRobot dataset already pushed to the hub from codebase version
 2.0 to 2.1.
 
+This is mainly for diffusion policy. Because of the new per-episode stats, we need to recompute them for all episodes. This script will do it for you and push the new version to the hub.
+
 It will:
 - Generate per-episodes stats and writes them in episodes_stats.jsonl
 - Check consistency between these new stats and the old ones.
@@ -19,9 +21,9 @@ python -m lerobot.datasets.v21.convert_dataset_v20_to_v21 \
 
 Convert a local dataset (works in place):
 '''bash
-python -m lerobot.datasets.v21.convert_dataset_v20_to_v21 \
-    --repo-id=aliberts/koch_tutorial \
-    --root=/path/to/local/dataset/directory \
+python converter.py \
+    --repo-id=data/Hf_data/Lusmse/realWorldPouring \
+    --root=. \
     --push-to-hub=false
 '''
 """
