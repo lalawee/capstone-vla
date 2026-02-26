@@ -232,3 +232,10 @@ dataset_tools/**/data/
 **/.cache/huggingface/
 **/huggingface_cache/
 dataset_tools/.hf_token
+
+
+third_party/gr00t/chkpts/
+third_party/gr00t/checkpoints/
+third_party/openpi/checkpoints/
+third_party/diffusion_policy/outputs/
+third_party/diffusion_policy/checkpoints/
