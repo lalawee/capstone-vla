@@ -37,6 +37,9 @@ Hand 10-sim -> 6-real mapping (extract MCP joints, drop PIP duplicates):
 
 observation.state uses obs/actions (last_action, time t)
 action uses data/demo_X/actions (commanded, time t)
+
+python hdf5_to_lerobot.py --input "/home/sensethreat/lab_mimic/VLA_IL/capstone-vla/dataset_tools/data/Hf_data/Lusmse/output_2_dataset.hdf5" --output "/home/sensethreat/lab_mimic/VLA_IL/capstone-vla/dataset_tools/data/Hf_data/Lusmse/sdg_trial" --trim-start 0.5
+
 """
 
 import argparse

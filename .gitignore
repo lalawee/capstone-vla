@@ -231,3 +231,4 @@ dataset_tools/**/data/
 # Hugging Face cache (optional)
 **/.cache/huggingface/
 **/huggingface_cache/
+dataset_tools/.hf_token
